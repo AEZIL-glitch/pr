@@ -1,0 +1,214 @@
+name: 📊 Daily Project Briefing
+
+on:
+  schedule:
+    # 每天北京时间早 8:05 运行（UTC 0:05）
+    - cron: '5 0 * * *'
+  # 也支持手动触发
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Collect Repository Activity
+        id: collect
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from datetime import datetime, timezone, timedelta
+
+          beijing_tz = timezone(timedelta(hours=8))
+          now = datetime.now(beijing_tz)
+          yesterday = now - timedelta(days=1)
+
+          report = {
+              "date": now.strftime("%Y-%m-%d"),
+              "weekday": ["周一","周二","周三","周四","周五","周六","周日"][now.weekday()],
+              "repo": os.popen("git remote get-url origin 2>/dev/null").read().strip().replace("https://github.com/", ""),
+              "sections": {}
+          }
+
+          # 1. 最近 24h 提交
+          git_log = os.popen(
+              'git log --since="' + yesterday.strftime("%Y-%m-%dT%H:%M:%S") + '" '
+              '--until="' + now.strftime("%Y-%m-%dT%H:%M:%S") + '" '
+              '--pretty=format:"%h|%an|%s|%ar" --date=short 2>/dev/null'
+          ).read().strip()
+
+          commits = []
+          for line in git_log.split("\n"):
+              if not line.strip():
+                  continue
+              parts = line.split("|", 3)
+              if len(parts) == 4:
+                  commits.append({
+                      "hash": parts[0],
+                      "author": parts[1],
+                      "message": parts[2],
+                      "time": parts[3]
+                  })
+          report["sections"]["commits"] = commits
+
+          # 2. 活跃分支
+          branches = os.popen(
+              'git branch -r --sort=-committerdate 2>/dev/null | head -10'
+          ).read().strip()
+          report["sections"]["active_branches"] = [b.strip() for b in branches.split("\n") if b.strip()]
+
+          # 3. GitHub API 获取 Issue/PR
+          gh_token = os.environ.get("GITHUB_TOKEN", "")
+          repo_full = os.environ.get("GITHUB_REPOSITORY", "")
+
+          if gh_token and repo_full:
+              import urllib.request
+              headers = {
+                  "Authorization": f"Bearer {gh_token}",
+                  "Accept": "application/vnd.github.v3+json",
+                  "User-Agent": "daily-briefing-action"
+              }
+              def gh_api(url):
+                  req = urllib.request.Request(url, headers=headers)
+                  try:
+                      with urllib.request.urlopen(req, timeout=10) as resp:
+                          return json.loads(resp.read())
+                  except Exception as e:
+                      return {"error": str(e)}
+
+              since_iso = yesterday.strftime("%Y-%m-%dT%H:%M:%SZ")
+              issues_data = gh_api(f"https://api.github.com/repos/{repo_full}/issues?state=all&since={since_iso}&per_page=10")
+              if isinstance(issues_data, list):
+                  issues_list = []
+                  for i in issues_data:
+                      if "pull_request" not in i:
+                          issues_list.append({
+                              "number": i["number"],
+                              "title": i["title"],
+                              "state": i["state"],
+                              "author": i["user"]["login"],
+                              "labels": [l["name"] for l in i["labels"]],
+                              "created": i["created_at"]
+                          })
+                  report["sections"]["issues"] = issues_list
+
+              pulls_data = gh_api(f"https://api.github.com/repos/{repo_full}/pulls?state=all&per_page=10")
+              if isinstance(pulls_data, list):
+                  pulls_list = []
+                  for p in pulls_data:
+                      pulls_list.append({
+                          "number": p["number"],
+                          "title": p["title"],
+                          "state": p["state"],
+                          "author": p["user"]["login"],
+                          "draft": p["draft"],
+                          "labels": [l["name"] for l in p["labels"]],
+                          "created": p["created_at"]
+                      })
+                  report["sections"]["pull_requests"] = pulls_list
+
+          with open("briefing.json", "w", encoding="utf-8") as f:
+              json.dump(report, f, indent=2, ensure_ascii=False)
+          print(f"Collected: {len(commits)} commits, {len(report['sections'].get('issues',[]))} issues, {len(report['sections'].get('pull_requests',[]))} PRs")
+          PYEOF
+
+      - name: Generate Briefing Markdown
+        id: briefing_md
+        run: |
+          python3 << 'PYEOF'
+          import json
+          with open("briefing.json", "r", encoding="utf-8") as f:
+              report = json.load(f)
+
+          s = report["sections"]
+          md = "# Daily Briefing - " + report["date"] + " (" + report["weekday"] + ")\n\n"
+          md += "**Repo:** " + report["repo"] + "\n\n---\n\n"
+
+          # Commits
+          commits = s.get("commits", [])
+          md += "## Commits\n\n"
+          if commits:
+              md += "| Hash | Author | Message | When |\n|------|--------|---------|------|\n"
+              for c in commits:
+                  msg = c["message"][:60] + ("..." if len(c["message"]) > 60 else "")
+                  md += "| `" + c["hash"] + "` | " + c["author"] + " | " + msg + " | " + c["time"] + " |\n"
+          else:
+              md += "_No new commits in the last 24 hours._\n"
+          md += "\n---\n"
+
+          # Issues
+          issues = s.get("issues", [])
+          md += "## Issues\n\n"
+          if issues:
+              for i in issues:
+                  icon = ":white_check_mark:" if i["state"] == "closed" else ":green_circle:"
+                  labels = " `" + " ".join(i["labels"]) + "`" if i["labels"] else ""
+                  md += "- " + icon + " **#" + str(i["number"]) + "** " + i["title"] + labels + " - @" + i["author"] + "\n"
+          else:
+              md += "_No issue activity._\n"
+          md += "\n---\n"
+
+          # PRs
+          pulls = s.get("pull_requests", [])
+          md += "## Pull Requests\n\n"
+          if pulls:
+              for p in pulls:
+                  icon = ":pencil:" if p.get("draft") else ":arrows_counterclockwise:"
+                  state_icon = ":white_check_mark:" if p["state"] == "closed" else ":green_circle:"
+                  labels = " `" + " ".join(p["labels"]) + "`" if p["labels"] else ""
+                  md += "- " + icon + state_icon + " **#" + str(p["number"]) + "** " + p["title"] + labels + " - @" + p["author"] + "\n"
+          else:
+              md += "_No active pull requests._\n"
+          md += "\n---\n"
+
+          # Branches
+          branches = s.get("active_branches", [])
+          md += "## Active Branches\n\n"
+          if branches:
+              for b in branches:
+                  md += "- `" + b + "`\n"
+          else:
+              md += "_None._\n"
+
+          md += "\n---\n*Auto-generated on " + report["date"] + "*\n"
+
+          with open("briefing.md", "w", encoding="utf-8") as f:
+              f.write(md)
+          print("Briefing generated")
+          PYEOF
+
+      - name: Upload Briefing as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-briefing
+          path: briefing.md
+
+      - name: Post Briefing as Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const briefing = fs.readFileSync('briefing.md', 'utf8');
+            const today = new Date().toISOString().slice(0, 10);
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Daily Briefing - ${today}`,
+              body: briefing,
+              labels: ['daily-briefing', 'automated']
+            });
+            console.log('Briefing posted as issue #' + result.data.number);

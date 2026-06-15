@@ -1,0 +1,195 @@
+name: 🤖 AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Get PR Diff
+        id: diff
+        run: |
+          # 获取 PR 的完整 diff
+          git fetch origin ${{ github.base_ref }}
+          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          git diff origin/${{ github.base_ref }}...HEAD --stat > pr.stat
+          echo "changed_files=$(wc -l < pr.stat)" >> $GITHUB_OUTPUT
+
+      - name: 🔍 Automated Code Analysis
+        id: analysis
+        run: |
+          python3 << 'PYEOF'
+          import os, re, json
+
+          issues = {
+              "critical": [],
+              "warnings": [],
+              "suggestions": []
+          }
+
+          # 读取 diff
+          with open("pr.diff", "r", errors="ignore") as f:
+              diff = f.read()
+
+          # 读取改动的文件列表
+          with open("pr.stat", "r", errors="ignore") as f:
+              stat = f.read()
+
+          changed_files = []
+          for line in stat.strip().split("\n"):
+              parts = line.split()
+              if parts and parts[-1].startswith(("src/", "app/", "lib/", "tests/", "*.py", "*.js", "*.ts", "*.tsx", "*.jsx")):
+                  changed_files.append(parts[-1] if parts[-1].startswith(("src/", "app/", "lib/", "tests/")) else line)
+
+          # 1. 检查调试语句
+          debug_patterns = [
+              (r'^\s*print\(', "Print 语句", "调试用的 print 语句遗留在代码中，建议删除或改用 logger"),
+              (r'console\.log\(', "console.log", "调试日志在 PR 中，建议清理"),
+              (r'^\s*#\s*TODO', "TODO 注释", "有待办事项标记"),
+              (r'^\s*#\s*FIXME', "FIXME 注释", "有 FIXME 标记，需关注"),
+              (r'^\s*#\s*HACK', "HACK 注释", "有 HACK 标记，建议重构"),
+              (r'debugger', "debugger 语句", "调试断点遗留"),
+          ]
+
+          for pattern, name, msg in debug_patterns:
+              matches = re.finditer(pattern, diff, re.MULTILINE)
+              for m in matches:
+                  line_num = diff[:m.start()].count("\n") + 1
+                  issues["warnings"].append(f"**{name}** (第 ~{line_num} 行): {msg}")
+
+          # 2. 检查合并冲突标记
+          if re.search(r'<<<<<<< |=======|>>>>>>>', diff):
+              issues["critical"].append("**合并冲突标记**: 代码中包含 <<<<<<< / ======= / >>>>>>> 冲突标记，需要解决")
+
+          # 3. 检查密钥/凭证泄漏
+          secret_patterns = [
+              (r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\']+["\']', "密码硬编码"),
+              (r'(?i)(api[_-]?key|apikey)\s*[=:]\s*["\'][^"\']+["\']', "API Key 硬编码"),
+              (r'(?i)(secret|token)\s*[=:]\s*["\'][^"\']{8,}["\']', "密钥/Token 硬编码"),
+              (r'(?i)(AKIA[0-9A-Z]{16})', "AWS Access Key"),
+              (r'(?i)(sk-[a-zA-Z0-9]{20,})', "OpenAI API Key"),
+          ]
+          for pattern, name in secret_patterns:
+              matches = re.findall(pattern, diff)
+              if matches:
+                  issues["critical"].append(f"**{name}**: 检测到可能的凭证泄漏！请立即移除")
+
+          # 4. 统计文件改动大小
+          large_files = []
+          for line in stat.strip().split("\n"):
+              if not line.strip():
+                  continue
+              m = re.search(r'(\d+)\s+insertion', line)
+              if m and int(m.group(1)) > 300:
+                  large_files.append(line.strip())
+          if large_files:
+              issues["suggestions"].append(f"**大文件改动**: {'; '.join(large_files)} — 超过 300 行变更，建议拆分为多个 PR")
+
+          # 5. 检查新文件是否有空文件
+          for line in stat.strip().split("\n"):
+              if "0 insertions" in line and "0 deletions" in line:
+                  issues["warnings"].append(f"**空文件变更**: {line.strip()}")
+
+          # 输出结果
+          summary = {
+              "total_critical": len(issues["critical"]),
+              "total_warnings": len(issues["warnings"]),
+              "total_suggestions": len(issues["suggestions"]),
+              "critical": issues["critical"],
+              "warnings": issues["warnings"],
+              "suggestions": issues["suggestions"],
+              "changed_files": stat.strip().split("\n") if stat.strip() else [],
+          }
+
+          # 保存分析结果
+          with open("analysis_result.json", "w") as f:
+              json.dump(summary, f, indent=2, ensure_ascii=False)
+
+          # 打印摘要
+          print(f"## 代码审查摘要")
+          print(f"发现 {len(issues['critical'])} 个严重问题, {len(issues['warnings'])} 个警告, {len(issues['suggestions'])} 个建议")
+          print(f"改动文件数: {len(summary['changed_files'])}")
+
+          PYEOF
+
+      - name: 📝 Post Review Comment
+        if: steps.analysis.outcome == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const analysis = JSON.parse(fs.readFileSync('analysis_result.json', 'utf8'));
+
+            // 构建审查报告
+            let body = `## 🤖 AI 代码审查报告\n\n`;
+
+            // 总体评分
+            const totalIssues = analysis.total_critical + analysis.total_warnings + analysis.total_suggestions;
+            let rating = totalIssues === 0 ? "✅ **完美通过**" :
+                         analysis.total_critical > 0 ? "🔴 **需要修改**" :
+                         analysis.total_warnings > 0 ? "🟡 **有改进空间**" : "🟢 **基本合格**";
+            body += `**总体评价**: ${rating}\n`;
+            body += `| 类型 | 数量 |\n|------|:----:|\n`;
+            body += `| 🔴 严重 | ${analysis.total_critical} |\n`;
+            body += `| 🟡 警告 | ${analysis.total_warnings} |\n`;
+            body += `| 💡 建议 | ${analysis.total_suggestions} |\n\n`;
+
+            // 改动文件统计
+            body += `### 📁 改动文件 (${analysis.changed_files.length} 个)\n\`\`\`\n`;
+            body += analysis.changed_files.join('\n');
+            body += '\n```\n\n';
+
+            // 严重问题
+            if (analysis.critical.length > 0) {
+              body += '### 🔴 严重问题\n';
+              analysis.critical.forEach(item => body += `- ${item}\n`);
+              body += '\n';
+            }
+
+            // 警告
+            if (analysis.warnings.length > 0) {
+              body += '### 🟡 警告\n';
+              analysis.warnings.forEach(item => body += `- ${item}\n`);
+              body += '\n';
+            }
+
+            // 建议
+            if (analysis.suggestions.length > 0) {
+              body += '### 💡 改进建议\n';
+              analysis.suggestions.forEach(item => body += `- ${item}\n`);
+              body += '\n';
+            }
+
+            // 如果没有问题
+            if (totalIssues === 0) {
+              body += '✨ 没有发现问题，代码质量不错！继续保持！\n\n';
+            }
+
+            body += `---\n*由 AI 代码审查机器人自动生成 🤖*\n`;
+
+            // 作为 PR review 提交
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              event: analysis.total_critical > 0 ? 'REQUEST_CHANGES' :
+                     analysis.total_warnings > 0 ? 'COMMENT' : 'APPROVE',
+              body: body
+            });
